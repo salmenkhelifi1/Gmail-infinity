@@ -33,14 +33,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 import threading
 try:
+    from utils.qr_processor import QRProcessor
+except ImportError:
+    pass
+
+try:
+    import aiohttp
+    import aiofiles
     from playwright.async_api import Page, BrowserContext
 except ImportError:
     pass
 
-# Third-party imports with error handling
-try:
-    import aiohttp
-    import aiofiles
     from tqdm import tqdm
     from rich.console import Console
     from rich.table import Table
@@ -152,6 +155,11 @@ class AppLogger:
         self.console.print(f"💀 {masked}", style="bold red reverse")
         self.logger.critical(masked)
         sys.exit(1)
+    
+    def debug(self, message: str):
+        """Log debug message with masking"""
+        masked = mask_sensitive(message)
+        self.logger.debug(masked)
 
 logger = AppLogger()
 
@@ -1871,6 +1879,80 @@ class DeepTrustBuilder:
         return page
 
 # ============================================================================
+# SHADOW MOBILE CONTEXT — THE EMISSARY FOR DEVICE TRUST
+# ============================================================================
+
+class ShadowMobileContext:
+    """
+    Spawns a mobile-emulated browser context to handle QR verification links.
+    Google often requires scanning a QR code to 'trust' the creation device.
+    By opening the decoded QR link in a mobile session, we simulate that trust.
+    """
+    
+    def __init__(self, main_browser: 'StealthBrowser'):
+        self.main_browser = main_browser
+        self.mobile_context = None
+        self.mobile_page = None
+    
+    async def resolve_verification_link(self, url: str, fingerprint: Dict[str, Any], proxy: Optional[str] = None) -> bool:
+        """Opens the link in a mobile session and attempts to verify."""
+        logger.info(f"🚀 Launching Mobile Emissary to resolve: {url[:60]}...", show_console=True)
+        try:
+            # Create mobile-specific options
+            mobile_options = {
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+                "viewport": {"width": 390, "height": 844},
+                "is_mobile": True,
+                "has_touch": True,
+                "device_scale_factor": 3,
+            }
+            
+            # Use same proxy as main account
+            if proxy:
+                parts = proxy.split(':')
+                if len(parts) >= 4:
+                    mobile_options['proxy'] = {
+                        "server": f"http://{parts[0]}:{parts[1]}",
+                        "username": parts[2],
+                        "password": parts[3]
+                    }
+            
+            # Temporary context for the mobile session
+            self.mobile_context = await self.main_browser.browser.new_context(**mobile_options)
+            self.mobile_page = await self.mobile_context.new_page()
+            
+            # Go to the Google verification link
+            await self.mobile_page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(random.uniform(2, 4))
+            
+            # Look for "Send SMS" or "Tap Yes" buttons on mobile view
+            potential_btns = [
+                'button:has-text("Send")',
+                'button:has-text("Next")',
+                'button:has-text("Continue")',
+                'button[jsname="LgbsSe"]'
+            ]
+            
+            for sel in potential_btns:
+                try:
+                    btn = await self.mobile_page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(3)
+                        break
+                except:
+                    continue
+            
+            logger.info("✅ Mobile Emissary finished verification task", show_console=True)
+            return True
+        except Exception as e:
+            logger.warning(f"❌ Mobile Emissary failed: {e}")
+            return False
+        finally:
+            if self.mobile_page: await self.mobile_page.close()
+            if self.mobile_context: await self.mobile_context.close()
+
+# ============================================================================
 # GMAIL CREATOR - MAIN ACCOUNT GENERATION ENGINE
 # ============================================================================
 
@@ -1961,7 +2043,28 @@ class GmailCreator:
                     await asyncio.sleep(0.2)
                 await page.keyboard.press("Enter")
             
-            await page.click('button:has-text("Next"), #personalDetailsNext')
+            # Click Next with robust selectors and retry
+            next_selectors = [
+                'button:has-text("Next")',
+                '#personalDetailsNext',
+                'button[jsname="LgbsSe"]',
+                'button[type="submit"]'
+            ]
+            
+            for sel in next_selectors:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(2) # Wait for page transition
+                        return True
+                except:
+                    continue
+            
+            # Fallback: keyboard Enter
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(2)
+            return True
             return True
         except Exception as e:
             logger.warning(f"Birthday step issue: {e}")
@@ -2256,22 +2359,87 @@ class GmailCreator:
         random.shuffle(chars)
         return ''.join(chars)
 
+    async def _step_resolve_qr(self, page: 'Page') -> bool:
+        """Detects, decodes, and resolves a QR code barrier."""
+        try:
+            logger.info("Analyzing QR code element...", show_console=True)
+            
+            # Locate the QR code image element
+            qr_selectors = [
+                 'img[src^="data:image/png;base64"]',
+                 'div[aria-label="QR code"] img',
+                 'canvas' # Some newer implementations use canvas
+            ]
+            
+            qr_el = None
+            for sel in qr_selectors:
+                qr_el = await page.query_selector(sel)
+                if qr_el and await qr_el.is_visible():
+                    break
+            
+            if not qr_el:
+                logger.warning("Could not find QR element to decode")
+                return False
+            
+            # Take a screenshot of just the QR code
+            qr_bytes = await qr_el.screenshot()
+            
+            # Decode the URL
+            qr_url = QRProcessor.decode_from_bytes(qr_bytes)
+            if not qr_url:
+                # Try full page screenshot as fallback (detector sometimes needs more context)
+                page_bytes = await page.screenshot()
+                qr_url = QRProcessor.decode_from_bytes(page_bytes)
+            
+            if not qr_url:
+                logger.error("Failed to decode QR code URL")
+                return False
+            
+            logger.success(f"Decoded QR URL: {qr_url[:50]}...")
+            
+            # Use Mobile Emissary to handle the link
+            emissary = ShadowMobileContext(self.browser)
+            # We assume current proxy and fingerprint context
+            success = await emissary.resolve_verification_link(qr_url, {}, getattr(self, 'current_proxy', None))
+            
+            if success:
+                logger.info("Waiting for desktop page to acknowledge verification...")
+                await asyncio.sleep(5)
+                # Check if QR is gone
+                if 'Scan the QR' not in (await page.text_content('body') or ''):
+                    logger.success("QR Block cleared successfully!")
+                    return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"QR Resolution failed: {e}")
+            return False
+
     async def _step_bypass_verification(self, page: 'Page') -> bool:
-        """STEP 5: Attempt to bypass QR/Phone verification"""
+        """STEP 5: Attempt to bypass or resolve QR/Phone verification"""
         logger.info("Step 5: Checking for verification...", show_console=True)
-        page_text = await page.text_content('body') or ''
-        if 'Scan the QR code' not in page_text: return True
+        await asyncio.sleep(2) # Give it time to load the challenge
         
-        logger.warning("QR code detected - attempting bypass...", show_console=True)
-        for sel in ['text="Try another way"', 'button:has-text("Skip")', 'button:has-text("Not now")']:
-            try:
-                btn = await page.query_selector(sel)
-                if btn and await btn.is_visible():
-                    await btn.click()
-                    await asyncio.sleep(2)
-                    if 'Scan the QR' not in await page.text_content('body'): return True
-            except: continue
-        return False
+        page_text = await page.text_content('body') or ''
+        
+        if 'Scan the QR code' in page_text:
+            logger.warning("QR code detected - attempting resolution...", show_console=True)
+            # Try to resolve it first
+            if await self._step_resolve_qr(page):
+                return True
+            
+            # If resolution failed, try the standard bypass buttons
+            logger.info("QR resolution failed, attempting skip buttons...")
+            for sel in ['text="Try another way"', 'button:has-text("Skip")', 'button:has-text("Not now")']:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(2)
+                        if 'Scan the QR' not in await page.text_content('body'): return True
+                except: continue
+                
+        return 'Scan the QR' not in (await page.text_content('body') or '')
 
     async def _step_handle_phone(self, page: 'Page', use_sms: bool = False) -> str:
         """STEP 6: Phone verification via SMS provider"""
@@ -2331,30 +2499,79 @@ class GmailCreator:
         """STEP 7: Terms and finalization"""
         logger.info("Step 7: Finalizing signup...", show_console=True)
         try:
-            # Recovery email
-            recovery = await page.query_selector('input[name="recoveryEmail"]')
-            if recovery:
-                recovery_email = persona.get('recovery_email', '')
-                if recovery_email:
-                    await recovery.click()
-                    await asyncio.sleep(0.3)
-                    for char in recovery_email:
-                        await page.keyboard.type(char)
-                        await asyncio.sleep(random.uniform(0.05, 0.12))
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(2)
+            # Recovery email handling (optional)
+            for _ in range(2): # Retry block for DOM instability
+                try:
+                    recovery = await page.query_selector('input[name="recoveryEmail"]')
+                    if recovery and await recovery.is_visible():
+                        recovery_email = persona.get('recovery_email', '')
+                        if recovery_email:
+                            await recovery.click()
+                            await recovery.fill('') # Clear any auto-filled garbage
+                            await recovery.type(recovery_email, delay=random.randint(50, 100))
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(2)
+                        break
+                    
+                    # If not found, check if we are already on terms page
+                    if await page.query_selector('button:has-text("I agree")'):
+                        break
+                    
+                    # Or check for "Skip" button on recovery email page
+                    skip = await page.query_selector('button:has-text("Skip")')
+                    if skip:
+                        await skip.click()
+                        await asyncio.sleep(2)
+                        break
+                except Exception as e:
+                    logger.debug(f"Recovery email step retry: {e}")
+                    await asyncio.sleep(1)
             
-            # Terms
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            agree = await page.query_selector('button:has-text("I agree"), button[jsname="LgbsSe"]')
-            if agree: await agree.click()
+            # Terms Page
+            logger.info("Accepting Google Terms...", show_console=True)
+            for _ in range(3): # More retries for the "Agree" wall
+                try:
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await asyncio.sleep(1)
+                    
+                    agree_selectors = [
+                        'button:has-text("I agree")',
+                        'button[jsname="LgbsSe"]',
+                        'button:has-text("Confirm")',
+                        'div[role="button"]:has-text("I agree")'
+                    ]
+                    
+                    clicked = False
+                    for sel in agree_selectors:
+                        btn = await page.query_selector(sel)
+                        if btn and await btn.is_visible():
+                            # Re-verify attachment before clicking to avoid DOM errors
+                            await btn.scroll_into_view_if_needed()
+                            await btn.click()
+                            clicked = True
+                            break
+                    
+                    if clicked:
+                        # Wait for either the dashboard or a known success page
+                        try:
+                            await page.wait_for_url(re.compile(r'(myaccount|mail).google.com'), timeout=15000)
+                            return True
+                        except:
+                            # Final URL check
+                            url = page.url
+                            if 'myaccount.google.com' in url or 'mail.google.com' in url:
+                                return True
+                    
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.debug(f"Terms page retry: {e}")
+                    await asyncio.sleep(1)
             
-            await asyncio.sleep(5)
             return 'myaccount.google.com' in page.url or 'mail.google.com' in page.url
         except Exception as e:
             logger.error(f"Finalization failed: {e}")
             return False
-    
+
     async def create_account(self, fingerprint: Dict[str, Any], persona: Dict[str, Any], 
                            proxy: Optional[str] = None,
                            trust_mode: bool = False,
@@ -2363,6 +2580,7 @@ class GmailCreator:
         """Executor for modular Gmail creation flow"""
         logger.info(f"Creating Gmail account for {persona['full_name']}...", show_console=True)
         
+        self.current_proxy = proxy
         try:
             page = await self.browser.create_context(fingerprint, proxy)
             

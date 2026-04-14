@@ -11,9 +11,10 @@ system:
   environment: "production"
   debug: false
   log_level: "WARNING"  # CRITICAL, ERROR, WARNING, INFO, DEBUG
+  headless_mode: false
   max_concurrent_creations: 5  # Optimal: 3-7, >10 triggers velocity detection
   account_warming_enabled: true
-  require_proxy: true
+  require_proxy: false
   encryption_key_path: "secrets/master.key"
   database_path: "data/accounts.db"
   session_timeout: 300  # seconds
@@ -262,7 +263,7 @@ gmail_creation:
 
 warming:
   enabled: true
-  require_proxy: true
+  require_proxy: false
   
   immediate_actions:
     enable_2fa: true
@@ -367,7 +368,7 @@ api:
   host: "0.0.0.0"
   port: 8443
   ssl_enabled: true
-  require_proxy: true
+  require_proxy: false
   ssl_cert: "certs/server.crt"
   ssl_key: "certs/server.key"
   auth_required: true

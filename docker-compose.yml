@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: gmail-infinity-factory:latest
+    container_name: gmail-infinity-sandbox
+    # Enable interactive TUI support
+    stdin_open: true
+    tty: true
+    # Shared memory for Chromium (prevents crashes)
+    shm_size: '2gb'
+    # Required for some browser automation features
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      # Persistent configuration and data storage
+      - ./config:/app/config:rw
+      - ./logs:/app/logs:rw
+      - ./credentials:/app/credentials:rw
+      - ./output:/app/output:rw
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - TERM=xterm-256color
+    restart: "no"

@@ -27,7 +27,7 @@ pycryptodome>=3.19.0
 # --- Identity Generation ---
 faker>=20.0.0
 names>=0.3.0
-mimesis>=14.0.0
+mimesis>=11.0.0
 
 # --- HTTP & Networking ---
 aiohttp>=3.9.0,<4.0
